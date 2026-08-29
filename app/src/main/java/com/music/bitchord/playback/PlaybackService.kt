@@ -6,6 +6,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -15,6 +17,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
+import androidx.core.net.toUri
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
@@ -33,20 +37,37 @@ import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
+import androidx.media3.session.MediaLibraryService.LibraryParams
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import kotlinx.coroutines.guava.future
 import com.music.bitchord.MainActivity
 import com.music.bitchord.R
+import com.music.bitchord.data.LocalMediaRepository
+import com.music.bitchord.data.YtMusicRepository
+import com.music.bitchord.data.lyrics.EmbeddedLyrics
+import com.music.bitchord.data.lyrics.LyricLine
+import com.music.bitchord.data.lyrics.LyricsRepository
+import com.music.bitchord.data.model.NOTIFICATION_ART_PX
+import com.music.bitchord.data.model.SearchFilter
+import com.music.bitchord.data.model.SearchResult
+import com.music.bitchord.data.model.ShelfItem
+import com.music.bitchord.data.model.artworkAt
+import com.music.bitchord.download.Downloads
+import java.util.concurrent.ConcurrentHashMap
 import com.music.bitchord.data.Http
 import com.music.bitchord.data.LikeState
 import com.music.bitchord.data.NerdStats
 import com.music.bitchord.data.TrackLog
-import com.music.bitchord.data.YtMusicRepository
 import com.music.bitchord.data.discord.DiscordRPC
 import com.music.bitchord.data.innertube.PlaybackTracker
 import com.music.bitchord.data.stats.ListeningRecorder
@@ -62,7 +83,6 @@ import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.SourceStream
 import com.music.bitchord.data.sources.StreamFormat
 import com.music.bitchord.data.sources.TrackMatcher
-import com.music.bitchord.download.Downloads
 import com.music.bitchord.widget.MediaWidget
 import com.music.bitchord.widget.MediaWidgetSnapshot
 import kotlinx.coroutines.CoroutineScope
@@ -98,7 +118,7 @@ const val ACTION_TOGGLE_AUTOPLAY = "com.music.bitchord.action.TOGGLE_AUTOPLAY"
 const val ACTION_TOGGLE_SHUFFLE = "com.music.bitchord.action.TOGGLE_SHUFFLE"
 
 /**
- * Background playback via Media3. A [MediaSessionService] gives us the media
+ * Background playback via Media3. A [MediaLibraryService] gives us the media
  * notification, lockscreen/Bluetooth controls, and Android Auto surface for
  * free; UI processes attach with a MediaController.
  *
@@ -111,9 +131,35 @@ const val ACTION_TOGGLE_SHUFFLE = "com.music.bitchord.action.TOGGLE_SHUFFLE"
  * whole life; [CrossfadeController] rides on top of it as volume automation.
  */
 @UnstableApi
-class PlaybackService : MediaSessionService() {
+class PlaybackService : MediaLibraryService() {
 
-    private var mediaSession: MediaSession? = null
+    private var mediaSession: MediaLibrarySession? = null
+    private val searchResults = ConcurrentHashMap<String, List<Song>>()
+    private val songCache = ConcurrentHashMap<String, Song>()
+
+    /**
+     * [YtMusicRepository.home] cached briefly for Android Auto's browse tree.
+     *
+     * Recents and Quick Picks each read the same home feed, and Auto re-runs
+     * `onGetChildren` every time either folder is opened — including just
+     * backing out and back in. Without this, one glance at Quick Picks after
+     * Recents paid for the full three-way home fetch twice in a row, which is
+     * most of what read as lag browsing the car UI. The window is short
+     * enough that a pull-to-refresh-style wait for genuinely new content
+     * never has to wait this long for it.
+     */
+    private var cachedHome: Pair<Long, com.music.bitchord.data.model.HomeFeed>? = null
+    private val homeMutex = Mutex()
+    private val HOME_CACHE_TTL_MS = 60_000L
+
+    private suspend fun cachedHomeFeed(): com.music.bitchord.data.model.HomeFeed? = homeMutex.withLock {
+        cachedHome?.let { (at, feed) ->
+            if (SystemClock.elapsedRealtime() - at < HOME_CACHE_TTL_MS) return feed
+        }
+        val feed = YtMusicRepository.home().getOrNull() ?: return null
+        cachedHome = SystemClock.elapsedRealtime() to feed
+        feed
+    }
 
     /**
      * The player the session is on. Swaps with [spare] at every crossfade — see
@@ -241,45 +287,10 @@ class PlaybackService : MediaSessionService() {
      */
     private val sessionSongHistory = mutableListOf<Song>()
 
-    private val sessionCallback = object : MediaSession.Callback {
-        override fun onConnect(
-            session: MediaSession,
-            controller: MediaSession.ControllerInfo,
-        ): MediaSession.ConnectionResult {
-            // The media notification controller is a normal Media3 controller. Its custom
-            // buttons are omitted unless their commands are explicitly available.
-            val commands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
-                .buildUpon()
-                .add(favoriteCommand)
-                .add(autoplayCommand)
-                .add(shuffleCommand)
-                .build()
-            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
-                .setAvailableSessionCommands(commands)
-                .build()
-        }
-
-        override fun onCustomCommand(
-            session: MediaSession,
-            controller: MediaSession.ControllerInfo,
-            customCommand: SessionCommand,
-            args: Bundle,
-        ): ListenableFuture<SessionResult> {
-            when (customCommand.customAction) {
-                ACTION_TOGGLE_AUTOPLAY -> toggleAutoplayFromNotification()
-                ACTION_TOGGLE_SHUFFLE -> toggleShuffleFromNotification()
-                ACTION_TOGGLE_FAVORITE -> session.player.currentMediaItem?.mediaId?.let {
-                    toggleFavoriteFromNotification(it)
-                }
-                else -> return Futures.immediateFuture(
-                    SessionResult(SessionError.ERROR_NOT_SUPPORTED),
-                )
-            }
-            // The actual YouTube rating is asynchronous. The command itself has been accepted;
-            // the notification is refreshed when the network write completes.
-            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-        }
-    }
+    private var serviceLyricsJob: Job? = null
+    private var serviceLyrics: List<LyricLine>? = null
+    private var lastPublishedSubtitle: String? = null
+    private var lyricsTickerJob: Job? = null
 
     /**
      * Everything the service books against the player it is currently on.
@@ -352,8 +363,10 @@ class PlaybackService : MediaSessionService() {
             // on advancing through a song that has stopped — and finishes it.
             if (isPlaying) {
                 pushDiscordPresence(exoPlayer)
+                startLyricsTicker()
             } else {
                 clearDiscordPresence()
+                stopLyricsTicker()
             }
         }
 
@@ -385,8 +398,9 @@ class PlaybackService : MediaSessionService() {
             reason: Int,
         ) {
             val exoPlayer = player ?: return
-            if (reason == Player.DISCONTINUITY_REASON_SEEK && exoPlayer.isPlaying) {
-                pushDiscordPresence(exoPlayer)
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                if (exoPlayer.isPlaying) pushDiscordPresence(exoPlayer)
+                updateLyricSubtitle()
             }
         }
 
@@ -426,6 +440,8 @@ class PlaybackService : MediaSessionService() {
             autoplayLoadJob = null
             autoplaySeed = null
             loadAutoplayForCurrentTrack()
+            loadLyricsForCurrentTrack()
+            if (exoPlayer.isPlaying) startLyricsTicker()
             mediaSession?.setCustomLayout(notificationButtons())
         }
 
@@ -894,10 +910,9 @@ class PlaybackService : MediaSessionService() {
         crossfade = controller
         controller.start()
 
-        mediaSession = MediaSession.Builder(this, SessionPlayer(exoPlayer, controller))
+        mediaSession = MediaLibrarySession.Builder(this, SessionPlayer(exoPlayer, controller) { lastPublishedSubtitle }, MediaLibraryCallback())
             .setId(SESSION_ID)
             .setSessionActivity(sessionActivity())
-            .setCallback(sessionCallback)
             .build()
         mediaSession?.setCustomLayout(notificationButtons())
     }
@@ -1142,7 +1157,7 @@ class PlaybackService : MediaSessionService() {
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
-        mediaSession?.player = SessionPlayer(incoming, requireNotNull(crossfade))
+        mediaSession?.player = SessionPlayer(incoming, requireNotNull(crossfade)) { lastPublishedSubtitle }
 
         // The queue moving on used to arrive here as an item transition on the
         // one player that owned the queue. It cannot any more — the incoming
@@ -1334,6 +1349,8 @@ class PlaybackService : MediaSessionService() {
         // Covers crossfades too: a blended advance never reaches
         // onMediaItemTransition, and [adoptPlayer] calls this handler by hand.
         publishWidgetState()
+        loadLyricsForCurrentTrack()
+        if (exoPlayer.isPlaying) startLyricsTicker()
         // Cleared rather than re-published. The renderer is still
         // configured for the track that just ended at this point, so
         // reading the format here reports the *previous* song — which
@@ -2934,6 +2951,18 @@ class PlaybackService : MediaSessionService() {
                 spatialAudioProcessorB.enabled = it
             }
         }
+        scope.launch {
+            combine(
+                AppSettings.syncedLyrics,
+                AppSettings.lyricsSources,
+                AppSettings.lyricsSourceOrder,
+                AppSettings.prioritizeSyllableSync,
+            ) { synced, sources, order, prio ->
+                synced to sources
+            }.distinctUntilChanged().collect {
+                loadLyricsForCurrentTrack()
+            }
+        }
     }
 
     private fun observeScrobbling() {
@@ -3212,7 +3241,7 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? =
         mediaSession
 
     /**
@@ -3242,6 +3271,11 @@ class PlaybackService : MediaSessionService() {
         // swipe-away, so a widget left on the home screen would sit there with a
         // pause glyph on a service that no longer exists.
         publishWidgetState(playing = false)
+        lyricsTickerJob?.cancel()
+        lyricsTickerJob = null
+        serviceLyricsJob?.cancel()
+        serviceLyricsJob = null
+        serviceLyrics = null
         AudioCache.cancel()
         trackAnalyzer.release()
         // The YouTube Music history entry for whatever was playing, closed out
@@ -3308,6 +3342,98 @@ class PlaybackService : MediaSessionService() {
         super.onDestroy()
     }
 
+    private fun loadLyricsForCurrentTrack() {
+        val currentSong = player?.currentMediaItem?.toSong() ?: run {
+            serviceLyrics = null
+            stopLyricsTicker()
+            return
+        }
+
+        if (!AppSettings.syncedLyrics.value) {
+            serviceLyrics = null
+            stopLyricsTicker()
+            return
+        }
+
+        serviceLyricsJob?.cancel()
+        serviceLyricsJob = scope.launch(Dispatchers.IO) {
+            val localUri = currentSong.localUri
+            var lines: List<LyricLine>? = null
+            if (localUri != null) {
+                lines = EmbeddedLyrics.forUri(this@PlaybackService, localUri)
+            }
+            if (lines == null) {
+                val durationMs = (player?.duration ?: 0L).takeIf { it > 0 } ?: 0L
+                val found = LyricsRepository.lyrics(
+                    videoId = currentSong.videoId,
+                    title = currentSong.title,
+                    artist = currentSong.artist,
+                    durationMs = durationMs,
+                    album = currentSong.albumName,
+                    sources = AppSettings.lyricsSources.value,
+                    order = AppSettings.lyricsSourceOrder.value,
+                    prioritizeSyllableSync = AppSettings.prioritizeSyllableSync.value,
+                )
+                lines = found?.lines
+            }
+            serviceLyrics = lines
+            if (player?.isPlaying == true) {
+                withContext(Dispatchers.Main) {
+                    updateLyricSubtitle()
+                }
+            }
+        }
+    }
+
+    private fun startLyricsTicker() {
+        if (lyricsTickerJob?.isActive == true) return
+        lyricsTickerJob = scope.launch(Dispatchers.Main) {
+            while (isActive) {
+                updateLyricSubtitle()
+                delay(500L)
+            }
+        }
+    }
+
+    private fun stopLyricsTicker() {
+        lyricsTickerJob?.cancel()
+        lyricsTickerJob = null
+        updateLyricSubtitle()
+    }
+
+    private fun updateLyricSubtitle() {
+        val exoPlayer = player ?: return
+        val currentSong = exoPlayer.currentMediaItem?.toSong() ?: return
+        val lines = serviceLyrics
+        val pos = exoPlayer.currentPosition
+        val subtitleText = if (lines != null && lines.isNotEmpty() && AppSettings.syncedLyrics.value) {
+            val idx = lines.indexOfLast { it.timeMs <= pos }
+            val currentLine = lines.getOrNull(idx)
+            if (currentLine != null && !currentLine.isGap && currentLine.text.isNotBlank()) {
+                "♪ ${currentLine.text}"
+            } else {
+                currentSong.artist
+            }
+        } else {
+            currentSong.artist
+        }
+
+        if (subtitleText != lastPublishedSubtitle) {
+            lastPublishedSubtitle = subtitleText
+            val metadata = MediaMetadata.Builder()
+                .setTitle(currentSong.title)
+                .setArtist(currentSong.artist)
+                .setSubtitle(subtitleText)
+                .setAlbumTitle(currentSong.albumName)
+                .setArtworkUri(currentSong.artworkAt(NOTIFICATION_ART_PX)?.toUri())
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                .setIsPlayable(true)
+                .setIsBrowsable(false)
+                .build()
+            exoPlayer.playlistMetadata = metadata
+        }
+    }
+
     /**
      * What the MediaSession, and so every control surface, actually talks to.
      *
@@ -3338,7 +3464,18 @@ class PlaybackService : MediaSessionService() {
     private class SessionPlayer(
         player: Player,
         private val crossfade: CrossfadeController,
+        private val getSubtitle: () -> String?,
     ) : ForwardingPlayer(player) {
+
+        override fun getMediaMetadata(): MediaMetadata {
+            val base = wrappedPlayer.mediaMetadata
+            val subtitle = getSubtitle()
+            return if (!subtitle.isNullOrBlank()) {
+                base.buildUpon().setSubtitle(subtitle).build()
+            } else {
+                base
+            }
+        }
 
         override fun seekToPreviousMediaItem() {
             crossfade.onSkipRequested()
@@ -3356,7 +3493,585 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /**
+     * Handles browsing and content resolution for Android Auto and other MediaBrowser clients.
+     */
+    private inner class MediaLibraryCallback : MediaLibrarySession.Callback {
+
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): MediaSession.ConnectionResult {
+            // The media notification controller is a normal Media3 controller. Its custom
+            // buttons are omitted unless their commands are explicitly available.
+            val commands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
+                .buildUpon()
+                .add(favoriteCommand)
+                .add(autoplayCommand)
+                .add(shuffleCommand)
+                .build()
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(commands)
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            when (customCommand.customAction) {
+                ACTION_TOGGLE_AUTOPLAY -> toggleAutoplayFromNotification()
+                ACTION_TOGGLE_SHUFFLE -> toggleShuffleFromNotification()
+                ACTION_TOGGLE_FAVORITE -> session.player.currentMediaItem?.mediaId?.let {
+                    toggleFavoriteFromNotification(it)
+                }
+                else -> return Futures.immediateFuture(
+                    SessionResult(SessionError.ERROR_NOT_SUPPORTED),
+                )
+            }
+            // The actual YouTube rating is asynchronous. The command itself has been accepted;
+            // the notification is refreshed when the network write completes.
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
+
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            val isRecent = params?.isRecent == true ||
+                params?.extras?.getBoolean("android.service.media.extra.RECENT") == true ||
+                params?.extras?.getBoolean("androidx.media.MediaBrowserCompat.EXTRA_RECENT") == true
+
+            val rootId = if (isRecent) MEDIA_RECENTS_ID else MEDIA_ROOT_ID
+            val rootExtras = Bundle().apply {
+                putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+                putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
+            }
+            val rootItem = MediaItem.Builder()
+                .setMediaId(rootId)
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(getString(R.string.app_name))
+                        .setIsBrowsable(true)
+                        .setIsPlayable(false)
+                        .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
+                        .setExtras(rootExtras)
+                        .build(),
+                )
+                .build()
+            val rootParams = LibraryParams.Builder()
+                .setExtras(rootExtras)
+                .build()
+            return Futures.immediateFuture(LibraryResult.ofItem(rootItem, rootParams))
+        }
+
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
+            var isGridFolder = false
+            val items: List<MediaItem> = when (parentId) {
+                MEDIA_ROOT_ID -> listOf(
+                    createFolderItem(MEDIA_RECENTS_ID, "Recents", folderType = MediaMetadata.FOLDER_TYPE_MIXED, isGrid = true),
+                    createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", folderType = MediaMetadata.FOLDER_TYPE_MIXED, isGrid = true),
+                    createFolderItem(MEDIA_LIKED_ID, "Liked Music", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS),
+                    createFolderItem(MEDIA_DOWNLOADS_ID, "Downloads", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
+                    createFolderItem(MEDIA_PLAYLISTS_ID, "Playlists", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS),
+                    createFolderItem(MEDIA_LOCAL_MUSIC_ID, "Local Music", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
+                )
+                MEDIA_RECENTS_ID -> {
+                    isGridFolder = true
+                    val last = LastPlayed.load()
+                    val lastSongs = last?.songs ?: emptyList()
+                    lastSongs.forEach { songCache[it.videoId] = it }
+                    val home = cachedHomeFeed()
+                    val recentShelf = home?.shelves?.firstOrNull {
+                        it.title.contains("recent", ignoreCase = true) ||
+                            it.title.contains("listen again", ignoreCase = true)
+                    }
+                    val ytRecentSongs = recentShelf?.items?.mapNotNull { it.toMediaItemOrNull() } ?: emptyList()
+                    val combined = (lastSongs.map { it.toMediaItem() } + ytRecentSongs).distinctBy { it.mediaId }
+                    val resultItems = if (combined.isNotEmpty()) {
+                        combined
+                    } else {
+                        val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        downloaded.forEach { songCache[it.videoId] = it }
+                        downloaded.map { it.toMediaItem() }
+                    }
+                    resultItems.map { it.withGridStyle() }
+                }
+                MEDIA_QUICK_PICKS_ID -> {
+                    isGridFolder = true
+                    val home = cachedHomeFeed()
+                    val allItems = home?.shelves?.flatMap { shelf ->
+                        shelf.items.mapNotNull { it.toMediaItemOrNull() }
+                    } ?: emptyList()
+                    allItems.distinctBy { it.mediaId }.map { it.withGridStyle() }
+                }
+                MEDIA_LIKED_ID -> {
+                    val library = YtMusicRepository.library().getOrNull()
+                    val songs = library?.likedSongs?.ifEmpty { null }
+                        ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
+                        ?: emptyList()
+                    songs.forEach { songCache[it.videoId] = it }
+                    songs.map { it.toMediaItem() }
+                }
+                MEDIA_DOWNLOADS_ID -> {
+                    val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                    downloaded.forEach { songCache[it.videoId] = it }
+                    downloaded.map { it.toMediaItem() }
+                }
+                MEDIA_PLAYLISTS_ID -> {
+                    val playlists = YtMusicRepository.userPlaylists().getOrNull() ?: emptyList()
+                    playlists.map { playlist ->
+                        MediaItem.Builder()
+                            .setMediaId("playlist:${playlist.playlistId}")
+                            .setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle(playlist.title)
+                                    .setSubtitle(playlist.subtitle)
+                                    .setArtworkUri(playlist.thumbnailUrl?.artworkAt(NOTIFICATION_ART_PX)?.let { Uri.parse(it) })
+                                    .setIsBrowsable(true)
+                                    .setIsPlayable(true)
+                                    .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                                    .build(),
+                            )
+                            .build()
+                    }
+                }
+                MEDIA_LOCAL_MUSIC_ID -> {
+                    val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                    local.forEach { songCache[it.videoId] = it }
+                    local.map { it.toMediaItem() }
+                }
+                else -> {
+                    when {
+                        parentId.startsWith("playlist:") -> {
+                            val playlistId = parentId.removePrefix("playlist:")
+                            val songs = YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
+                                ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
+                                ?: emptyList()
+                            songs.forEach { songCache[it.videoId] = it }
+                            songs.map { it.toMediaItem() }
+                        }
+                        parentId.startsWith("browse:") -> {
+                            val browseId = parentId.removePrefix("browse:")
+                            val songs = YtMusicRepository.browseSongs(browseId).getOrNull()?.songs ?: emptyList()
+                            songs.forEach { songCache[it.videoId] = it }
+                            songs.map { it.toMediaItem() }
+                        }
+                        else -> emptyList()
+                    }
+                }
+            }
+            val returnParams = if (isGridFolder) {
+                LibraryParams.Builder().setExtras(Bundle().apply {
+                    putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                }).build()
+            } else {
+                params
+            }
+            LibraryResult.ofItemList(ImmutableList.copyOf(items), returnParams)
+        }
+
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> = scope.future(Dispatchers.IO) {
+            val item = when (mediaId) {
+                MEDIA_ROOT_ID -> MediaItem.Builder()
+                    .setMediaId(MEDIA_ROOT_ID)
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setTitle(getString(R.string.app_name))
+                            .setIsBrowsable(true)
+                            .setIsPlayable(false)
+                            .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
+                            .build(),
+                    ).build()
+                MEDIA_RECENTS_ID -> createFolderItem(MEDIA_RECENTS_ID, "Recents", isGrid = true)
+                MEDIA_QUICK_PICKS_ID -> createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", isGrid = true)
+                MEDIA_LIKED_ID -> createFolderItem(MEDIA_LIKED_ID, "Liked Music", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                MEDIA_DOWNLOADS_ID -> createFolderItem(MEDIA_DOWNLOADS_ID, "Downloads")
+                MEDIA_PLAYLISTS_ID -> createFolderItem(MEDIA_PLAYLISTS_ID, "Playlists", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                MEDIA_LOCAL_MUSIC_ID -> createFolderItem(MEDIA_LOCAL_MUSIC_ID, "Local Music")
+                else -> {
+                    val cached = songCache[mediaId]
+                    if (cached != null) {
+                        cached.toMediaItem()
+                    } else if (mediaId.startsWith("playlist:") || mediaId.startsWith("browse:")) {
+                        MediaItem.Builder()
+                            .setMediaId(mediaId)
+                            .setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle("Playlist")
+                                    .setIsBrowsable(true)
+                                    .setIsPlayable(true)
+                                    .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                                    .build(),
+                            ).build()
+                    } else {
+                        Song(videoId = mediaId, title = "Track", artist = "Artist", thumbnailUrl = null).toMediaItem()
+                    }
+                }
+            }
+            LibraryResult.ofItem(item, null)
+        }
+
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future(Dispatchers.IO) {
+            // 1. If player currently holds items in its queue, resume from it
+            val activePlayer = player
+            if (activePlayer != null && activePlayer.mediaItemCount > 0) {
+                val currentItems = (0 until activePlayer.mediaItemCount).map { activePlayer.getMediaItemAt(it) }
+                val startIndex = activePlayer.currentMediaItemIndex.coerceIn(0, currentItems.size - 1)
+                val startPositionMs = activePlayer.currentPosition.coerceAtLeast(0L)
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(currentItems),
+                    startIndex,
+                    startPositionMs,
+                )
+            }
+
+            // 2. Load from LastPlayed snapshot
+            val last = LastPlayed.load()
+            if (last != null && last.songs.isNotEmpty()) {
+                val items = last.songs.map { it.toMediaItem() }
+                val startIndex = last.index.coerceIn(0, items.size - 1)
+                val startPositionMs = last.positionMs
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(items),
+                    startIndex,
+                    startPositionMs,
+                )
+            }
+
+            // 3. Fallback to local downloaded songs (offline-ready)
+            val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+            if (downloaded.isNotEmpty()) {
+                val items = downloaded.map { it.toMediaItem() }
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(items),
+                    0,
+                    0L,
+                )
+            }
+
+            // 4. Fallback to device local music
+            val localSongs = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+            if (localSongs.isNotEmpty()) {
+                val items = localSongs.map { it.toMediaItem() }
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(items),
+                    0,
+                    0L,
+                )
+            }
+
+            // 5. Fallback to Quick Picks / Home shelves
+            val home = YtMusicRepository.home().getOrNull()
+            val fallbackSongs = home?.shelves?.flatMap { shelf ->
+                shelf.items.mapNotNull { it.toMediaItemOrNull() }
+            }?.distinctBy { it.mediaId } ?: emptyList()
+
+            if (fallbackSongs.isNotEmpty()) {
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(fallbackSongs),
+                    0,
+                    0L,
+                )
+            }
+
+            throw UnsupportedOperationException("No resume data available")
+        }
+
+        override fun onSearch(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> = scope.future(Dispatchers.IO) {
+            val results = YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull() ?: emptyList()
+            val songs = results.mapNotNull { if (it is SearchResult.Track) it.song else null }
+            searchResults[query] = songs
+            songs.forEach { songCache[it.videoId] = it }
+            session.notifySearchResultChanged(browser, query, songs.size, params)
+            LibraryResult.ofVoid(params)
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
+            val songs = searchResults[query] ?: (
+                YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull()
+                    ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
+                    ?: emptyList()
+            )
+            songs.forEach { songCache[it.videoId] = it }
+            val fromIndex = (page * pageSize).coerceAtMost(songs.size)
+            val toIndex = ((page + 1) * pageSize).coerceAtMost(songs.size)
+            val paged = if (fromIndex < toIndex) songs.subList(fromIndex, toIndex) else songs
+            val items = paged.map { it.toMediaItem() }
+            LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
+        }
+
+        override fun onSetMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: List<MediaItem>,
+            startIndex: Int,
+            startPositionMs: Long,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future(Dispatchers.IO) {
+            val resolved = onAddMediaItems(mediaSession, controller, mediaItems).get()
+            val validIndex = startIndex.coerceIn(0, (resolved.size - 1).coerceAtLeast(0))
+            MediaSession.MediaItemsWithStartPosition(
+                ImmutableList.copyOf(resolved),
+                validIndex,
+                startPositionMs.coerceAtLeast(0L),
+            )
+        }
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: List<MediaItem>,
+        ): ListenableFuture<List<MediaItem>> = scope.future(Dispatchers.IO) {
+            val resolved = mutableListOf<MediaItem>()
+            for (item in mediaItems) {
+                val id = item.mediaId
+                val searchQuery = item.requestMetadata.searchQuery
+                when {
+                    !searchQuery.isNullOrBlank() -> {
+                        val cached = searchResults[searchQuery]
+                        val songs = if (!cached.isNullOrEmpty()) {
+                            cached
+                        } else {
+                            YtMusicRepository.search(searchQuery, SearchFilter.SONGS).getOrNull()
+                                ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
+                                ?: emptyList()
+                        }
+                        songs.forEach { songCache[it.videoId] = it }
+                        if (songs.isNotEmpty()) {
+                            resolved.addAll(songs.map { it.toMediaItem() })
+                        }
+                    }
+                    id.startsWith("playlist:") -> {
+                        val playlistId = id.removePrefix("playlist:")
+                        val songs = YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
+                            ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
+                            ?: emptyList()
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id.startsWith("browse:") -> {
+                        val browseId = id.removePrefix("browse:")
+                        val songs = YtMusicRepository.browseSongs(browseId).getOrNull()?.songs ?: emptyList()
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_ROOT_ID || id == MEDIA_RECENTS_ID -> {
+                        val last = LastPlayed.load()
+                        val lastSongs = last?.songs ?: emptyList()
+                        lastSongs.forEach { songCache[it.videoId] = it }
+                        val home = YtMusicRepository.home().getOrNull()
+                        val recentShelf = home?.shelves?.firstOrNull {
+                            it.title.contains("recent", ignoreCase = true) ||
+                                it.title.contains("listen again", ignoreCase = true)
+                        } ?: home?.shelves?.firstOrNull()
+                        val ytRecentSongs = recentShelf?.items?.mapNotNull { it.toMediaItemOrNull() } ?: emptyList()
+                        val combined = (lastSongs.map { it.toMediaItem() } + ytRecentSongs).distinctBy { it.mediaId }
+                        if (combined.isNotEmpty()) {
+                            resolved.addAll(combined)
+                        } else {
+                            val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                            downloaded.forEach { songCache[it.videoId] = it }
+                            if (downloaded.isNotEmpty()) {
+                                resolved.addAll(downloaded.map { it.toMediaItem() })
+                            }
+                        }
+                    }
+                    id == MEDIA_QUICK_PICKS_ID -> {
+                        val home = YtMusicRepository.home().getOrNull()
+                        val allItems = home?.shelves?.flatMap { shelf ->
+                            shelf.items.mapNotNull { it.toMediaItemOrNull() }
+                        } ?: emptyList()
+                        resolved.addAll(allItems.distinctBy { it.mediaId })
+                    }
+                    id == MEDIA_LIKED_ID -> {
+                        val lib = YtMusicRepository.library().getOrNull()
+                        val songs = lib?.likedSongs?.ifEmpty { null }
+                            ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
+                            ?: emptyList()
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_DOWNLOADS_ID -> {
+                        val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        downloaded.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(downloaded.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_PLAYLISTS_ID -> {
+                        val playlists = YtMusicRepository.userPlaylists().getOrNull() ?: emptyList()
+                        val first = playlists.firstOrNull()
+                        if (first != null) {
+                            val songs = YtMusicRepository.browseSongs("VL${first.playlistId}").getOrNull()?.songs
+                                ?: YtMusicRepository.browseSongs(first.playlistId).getOrNull()?.songs
+                                ?: emptyList()
+                            songs.forEach { songCache[it.videoId] = it }
+                            resolved.addAll(songs.map { it.toMediaItem() })
+                        }
+                    }
+                    id == MEDIA_LOCAL_MUSIC_ID -> {
+                        val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                        local.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(local.map { it.toMediaItem() })
+                    }
+                    songCache.containsKey(id) -> {
+                        resolved.add(songCache[id]!!.toMediaItem())
+                    }
+                    item.localConfiguration != null -> {
+                        resolved.add(item)
+                    }
+                    item.requestMetadata.mediaUri != null -> {
+                        val uri = item.requestMetadata.mediaUri!!
+                        val videoId = uri.getQueryParameter("v") ?: uri.lastPathSegment.orEmpty()
+                        if (videoId.isNotEmpty() && !videoId.startsWith("http")) {
+                            val cached = songCache[videoId]
+                            if (cached != null) {
+                                resolved.add(cached.toMediaItem())
+                            } else {
+                                resolved.add(Song(videoId = videoId, title = item.mediaMetadata.title?.toString() ?: "Track", artist = item.mediaMetadata.artist?.toString() ?: "Artist", thumbnailUrl = null).toMediaItem())
+                            }
+                        } else {
+                            resolved.add(item.buildUpon().setUri(uri).build())
+                        }
+                    }
+                    else -> {
+                        val cached = songCache[id]
+                        if (cached != null) {
+                            resolved.add(cached.toMediaItem())
+                        } else {
+                            val song = item.toSong()
+                            resolved.add(song.toMediaItem())
+                        }
+                    }
+                }
+            }
+            if (resolved.isEmpty()) mediaItems else resolved
+        }
+    }
+
+    private fun createFolderItem(
+        mediaId: String,
+        title: String,
+        subtitle: String? = null,
+        folderType: Int = MediaMetadata.FOLDER_TYPE_MIXED,
+        isGrid: Boolean = false,
+    ): MediaItem {
+        val style = if (isGrid) CONTENT_STYLE_GRID_ITEM_HINT_VALUE else CONTENT_STYLE_LIST_ITEM_HINT_VALUE
+        val extras = Bundle().apply {
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, style)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, style)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, style)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, style)
+        }
+        return MediaItem.Builder()
+            .setMediaId(mediaId)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(title)
+                    .setSubtitle(subtitle)
+                    .setIsBrowsable(true)
+                    .setIsPlayable(false)
+                    .setFolderType(folderType)
+                    .setExtras(extras)
+                    .build(),
+            )
+            .build()
+    }
+
+    private fun MediaItem.withGridStyle(): MediaItem {
+        val currentExtras = mediaMetadata.extras ?: Bundle()
+        val newExtras = Bundle(currentExtras).apply {
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+        }
+        return buildUpon()
+            .setMediaMetadata(
+                mediaMetadata.buildUpon()
+                    .setExtras(newExtras)
+                    .build(),
+            )
+            .build()
+    }
+
+    private fun ShelfItem.toMediaItemOrNull(): MediaItem? {
+        val vid = videoId
+        if (vid != null) {
+            val song = Song(
+                videoId = vid,
+                title = title,
+                artist = subtitle,
+                thumbnailUrl = thumbnailUrl,
+            )
+            songCache[vid] = song
+            return song.toMediaItem()
+        }
+        val bid = browseId
+        if (bid != null) {
+            return MediaItem.Builder()
+                .setMediaId("browse:$bid")
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(title)
+                        .setSubtitle(subtitle)
+                        .setArtworkUri(thumbnailUrl.artworkAt(NOTIFICATION_ART_PX)?.let { Uri.parse(it) })
+                        .setIsBrowsable(true)
+                        .setIsPlayable(false)
+                        .setFolderType(MediaMetadata.FOLDER_TYPE_ALBUMS)
+                        .build(),
+                )
+                .build()
+        }
+        return null
+    }
+
     private companion object {
+        const val MEDIA_ROOT_ID = "root"
+        const val MEDIA_RECENTS_ID = "recents"
+        const val MEDIA_QUICK_PICKS_ID = "quick_picks"
+        const val MEDIA_LIKED_ID = "liked"
+        const val MEDIA_DOWNLOADS_ID = "downloads"
+        const val MEDIA_PLAYLISTS_ID = "playlists"
+        const val MEDIA_LOCAL_MUSIC_ID = "local_music"
+
+        // Android Auto Content Style Hints
+        const val EXTRA_CONTENT_STYLE_SUPPORTED = "android.media.browse.extra.CONTENT_STYLE_SUPPORTED"
+        const val EXTRA_CONTENT_STYLE_SUPPORTED_AX = "androidx.media.contentstyle.CONTENT_STYLE_SUPPORTED"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT = "android.media.browse.extra.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.extra.CONTENT_STYLE_PLAYABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX = "androidx.media.utils.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX = "androidx.media.utils.CONTENT_STYLE_PLAYABLE_HINT"
+        const val CONTENT_STYLE_LIST_ITEM_HINT_VALUE = 1
+        const val CONTENT_STYLE_GRID_ITEM_HINT_VALUE = 2
         /**
          * Shared by both players. Identical on purpose: they take turns being
          * the session, and a difference here would be an audible change of
