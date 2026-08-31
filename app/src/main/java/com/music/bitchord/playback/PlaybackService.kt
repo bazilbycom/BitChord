@@ -3549,6 +3549,16 @@ class PlaybackService : MediaLibraryService() {
             val rootExtras = Bundle().apply {
                 putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
                 putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
+                putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
             }
             val rootItem = MediaItem.Builder()
                 .setMediaId(rootId)
@@ -3565,6 +3575,12 @@ class PlaybackService : MediaLibraryService() {
             val rootParams = LibraryParams.Builder()
                 .setExtras(rootExtras)
                 .build()
+            scope.launch(Dispatchers.IO) {
+                try {
+                    cachedHomeFeed()
+                } catch (_: Exception) {}
+            }
+
             return Futures.immediateFuture(LibraryResult.ofItem(rootItem, rootParams))
         }
 
@@ -3576,25 +3592,23 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
-            var isGridFolder = false
+            val isGridFolder = parentId == MEDIA_RECENTS_ID || parentId == MEDIA_QUICK_PICKS_ID
             val items: List<MediaItem> = when (parentId) {
                 MEDIA_ROOT_ID -> listOf(
-                    createFolderItem(MEDIA_RECENTS_ID, "Recents", folderType = MediaMetadata.FOLDER_TYPE_MIXED, isGrid = true),
-                    createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", folderType = MediaMetadata.FOLDER_TYPE_MIXED, isGrid = true),
+                    createFolderItem(MEDIA_RECENTS_ID, "Recents", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true),
+                    createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true),
                     createFolderItem(MEDIA_LIKED_ID, "Liked Music", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS),
                     createFolderItem(MEDIA_DOWNLOADS_ID, "Downloads", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
                     createFolderItem(MEDIA_PLAYLISTS_ID, "Playlists", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS),
                     createFolderItem(MEDIA_LOCAL_MUSIC_ID, "Local Music", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
                 )
                 MEDIA_RECENTS_ID -> {
-                    isGridFolder = true
                     val last = LastPlayed.load()
                     val lastSongs = last?.songs ?: emptyList()
                     lastSongs.forEach { songCache[it.videoId] = it }
 
-                    // Only attempt network home feed with a short timeout so Android Auto doesn't freeze
                     val ytRecentSongs = try {
-                        withTimeoutOrNull(2000L) {
+                        withTimeoutOrNull(3000L) {
                             val home = cachedHomeFeed()
                             val recentShelf = home?.shelves?.firstOrNull {
                                 it.title.contains("recent", ignoreCase = true) ||
@@ -3608,24 +3622,23 @@ class PlaybackService : MediaLibraryService() {
 
                     val combined = (lastSongs.map { it.toMediaItem() } + ytRecentSongs).distinctBy { it.mediaId }
                     val resultItems = if (combined.isNotEmpty()) {
-                        combined
+                        val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                        downloaded.forEach { songCache[it.videoId] = it }
+                        local.forEach { songCache[it.videoId] = it }
+                        (combined + downloaded.map { it.toMediaItem() } + local.map { it.toMediaItem() }).distinctBy { it.mediaId }
                     } else {
                         val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
                         downloaded.forEach { songCache[it.videoId] = it }
-                        if (downloaded.isNotEmpty()) {
-                            downloaded.map { it.toMediaItem() }
-                        } else {
-                            val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
-                            local.forEach { songCache[it.videoId] = it }
-                            local.map { it.toMediaItem() }
-                        }
+                        local.forEach { songCache[it.videoId] = it }
+                        (downloaded.map { it.toMediaItem() } + local.map { it.toMediaItem() }).distinctBy { it.mediaId }
                     }
                     resultItems.map { it.withGridStyle() }
                 }
                 MEDIA_QUICK_PICKS_ID -> {
-                    isGridFolder = true
                     val allItems = try {
-                        withTimeoutOrNull(2500L) {
+                        withTimeoutOrNull(3500L) {
                             val home = cachedHomeFeed()
                             home?.shelves?.flatMap { shelf ->
                                 shelf.items.mapNotNull { it.toMediaItemOrNull() }
@@ -3639,14 +3652,12 @@ class PlaybackService : MediaLibraryService() {
                         allItems.distinctBy { it.mediaId }
                     } else {
                         val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
-                        if (downloaded.isNotEmpty()) {
-                            downloaded.forEach { songCache[it.videoId] = it }
-                            downloaded.map { it.toMediaItem() }
-                        } else {
-                            val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
-                            local.forEach { songCache[it.videoId] = it }
-                            local.map { it.toMediaItem() }
-                        }
+                        val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                        val last = LastPlayed.load()?.songs ?: emptyList()
+                        downloaded.forEach { songCache[it.videoId] = it }
+                        local.forEach { songCache[it.videoId] = it }
+                        last.forEach { songCache[it.videoId] = it }
+                        (downloaded.map { it.toMediaItem() } + local.map { it.toMediaItem() } + last.map { it.toMediaItem() }).distinctBy { it.mediaId }
                     }
                     resultItems.map { it.withGridStyle() }
                 }
@@ -3731,7 +3742,14 @@ class PlaybackService : MediaLibraryService() {
                             songs.forEach { songCache[it.videoId] = it }
                             songs.map { it.toMediaItem() }
                         }
-                        else -> emptyList()
+                        else -> {
+                            val cachedSong = songCache[parentId]
+                            if (cachedSong != null) {
+                                listOf(cachedSong.toMediaItem())
+                            } else {
+                                emptyList()
+                            }
+                        }
                     }
                 }
             }
@@ -3741,6 +3759,14 @@ class PlaybackService : MediaLibraryService() {
                     putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
                     putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
                     putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+                    putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
                 }).build()
             } else {
                 params
@@ -3764,8 +3790,8 @@ class PlaybackService : MediaLibraryService() {
                             .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
                             .build(),
                     ).build()
-                MEDIA_RECENTS_ID -> createFolderItem(MEDIA_RECENTS_ID, "Recents", isGrid = true)
-                MEDIA_QUICK_PICKS_ID -> createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", isGrid = true)
+                MEDIA_RECENTS_ID -> createFolderItem(MEDIA_RECENTS_ID, "Recents", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true)
+                MEDIA_QUICK_PICKS_ID -> createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true)
                 MEDIA_LIKED_ID -> createFolderItem(MEDIA_LIKED_ID, "Liked Music", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS)
                 MEDIA_DOWNLOADS_ID -> createFolderItem(MEDIA_DOWNLOADS_ID, "Downloads")
                 MEDIA_PLAYLISTS_ID -> createFolderItem(MEDIA_PLAYLISTS_ID, "Playlists", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS)
@@ -4118,6 +4144,14 @@ class PlaybackService : MediaLibraryService() {
             putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, style)
             putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, style)
             putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, style)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, style)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, style)
+            putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", style)
+            putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", style)
+            putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", style)
+            putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", style)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
         }
         return MediaItem.Builder()
             .setMediaId(mediaId)
@@ -4127,7 +4161,7 @@ class PlaybackService : MediaLibraryService() {
                     .setSubtitle(subtitle)
                     .setIsBrowsable(true)
                     .setIsPlayable(false)
-                    .setFolderType(folderType)
+                    .setFolderType(if (isGrid && folderType == MediaMetadata.FOLDER_TYPE_MIXED) MediaMetadata.FOLDER_TYPE_ALBUMS else folderType)
                     .setExtras(extras)
                     .build(),
             )
@@ -4137,12 +4171,25 @@ class PlaybackService : MediaLibraryService() {
     private fun MediaItem.withGridStyle(): MediaItem {
         val currentExtras = mediaMetadata.extras ?: Bundle()
         val newExtras = Bundle(currentExtras).apply {
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
             putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
             putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
         }
         return buildUpon()
             .setMediaMetadata(
                 mediaMetadata.buildUpon()
+                    .setIsBrowsable(true)
+                    .setIsPlayable(true)
+                    .setFolderType(MediaMetadata.FOLDER_TYPE_ALBUMS)
                     .setExtras(newExtras)
                     .build(),
             )
@@ -4194,10 +4241,12 @@ class PlaybackService : MediaLibraryService() {
         const val EXTRA_CONTENT_STYLE_SUPPORTED_AX = "androidx.media.contentstyle.CONTENT_STYLE_SUPPORTED"
         const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT = "android.media.browse.extra.CONTENT_STYLE_BROWSABLE_HINT"
         const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.extra.CONTENT_STYLE_PLAYABLE_HINT"
-        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX = "androidx.media.utils.CONTENT_STYLE_BROWSABLE_HINT"
-        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX = "androidx.media.utils.CONTENT_STYLE_PLAYABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX = "androidx.media.contentstyle.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX = "androidx.media.contentstyle.CONTENT_STYLE_PLAYABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY = "androidx.media.utils.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY = "androidx.media.utils.CONTENT_STYLE_PLAYABLE_HINT"
         const val CONTENT_STYLE_LIST_ITEM_HINT_VALUE = 1
-        const val CONTENT_STYLE_GRID_ITEM_HINT_VALUE = 2
+        const val CONTENT_STYLE_GRID_ITEM_HINT_VALUE = 4
         /**
          * Shared by both players. Identical on purpose: they take turns being
          * the session, and a difference here would be an audible change of
