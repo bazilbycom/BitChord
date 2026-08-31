@@ -3355,6 +3355,8 @@ class PlaybackService : MediaLibraryService() {
             return
         }
 
+        val trackDurationMs = (player?.duration ?: 0L).takeIf { it > 0 } ?: 0L
+
         serviceLyricsJob?.cancel()
         serviceLyricsJob = scope.launch(Dispatchers.IO) {
             val localUri = currentSong.localUri
@@ -3363,12 +3365,11 @@ class PlaybackService : MediaLibraryService() {
                 lines = EmbeddedLyrics.forUri(this@PlaybackService, localUri)
             }
             if (lines == null) {
-                val durationMs = (player?.duration ?: 0L).takeIf { it > 0 } ?: 0L
                 val found = LyricsRepository.lyrics(
                     videoId = currentSong.videoId,
                     title = currentSong.title,
                     artist = currentSong.artist,
-                    durationMs = durationMs,
+                    durationMs = trackDurationMs,
                     album = currentSong.albumName,
                     sources = AppSettings.lyricsSources.value,
                     order = AppSettings.lyricsSourceOrder.value,
@@ -3376,9 +3377,9 @@ class PlaybackService : MediaLibraryService() {
                 )
                 lines = found?.lines
             }
-            serviceLyrics = lines
-            if (player?.isPlaying == true) {
-                withContext(Dispatchers.Main) {
+            withContext(Dispatchers.Main) {
+                serviceLyrics = lines
+                if (player?.isPlaying == true) {
                     updateLyricSubtitle()
                 }
             }
@@ -3502,16 +3503,15 @@ class PlaybackService : MediaLibraryService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): MediaSession.ConnectionResult {
-            // The media notification controller is a normal Media3 controller. Its custom
-            // buttons are omitted unless their commands are explicitly available.
-            val commands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
+            val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
                 .buildUpon()
                 .add(favoriteCommand)
                 .add(autoplayCommand)
                 .add(shuffleCommand)
                 .build()
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
-                .setAvailableSessionCommands(commands)
+                .setAvailablePlayerCommands(MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS)
+                .setAvailableSessionCommands(sessionCommands)
                 .build()
         }
 
@@ -3591,37 +3591,84 @@ class PlaybackService : MediaLibraryService() {
                     val last = LastPlayed.load()
                     val lastSongs = last?.songs ?: emptyList()
                     lastSongs.forEach { songCache[it.videoId] = it }
-                    val home = cachedHomeFeed()
-                    val recentShelf = home?.shelves?.firstOrNull {
-                        it.title.contains("recent", ignoreCase = true) ||
-                            it.title.contains("listen again", ignoreCase = true)
+
+                    // Only attempt network home feed with a short timeout so Android Auto doesn't freeze
+                    val ytRecentSongs = try {
+                        withTimeoutOrNull(2000L) {
+                            val home = cachedHomeFeed()
+                            val recentShelf = home?.shelves?.firstOrNull {
+                                it.title.contains("recent", ignoreCase = true) ||
+                                    it.title.contains("listen again", ignoreCase = true)
+                            }
+                            recentShelf?.items?.mapNotNull { it.toMediaItemOrNull() }
+                        } ?: emptyList()
+                    } catch (_: Exception) {
+                        emptyList()
                     }
-                    val ytRecentSongs = recentShelf?.items?.mapNotNull { it.toMediaItemOrNull() } ?: emptyList()
+
                     val combined = (lastSongs.map { it.toMediaItem() } + ytRecentSongs).distinctBy { it.mediaId }
                     val resultItems = if (combined.isNotEmpty()) {
                         combined
                     } else {
                         val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
                         downloaded.forEach { songCache[it.videoId] = it }
-                        downloaded.map { it.toMediaItem() }
+                        if (downloaded.isNotEmpty()) {
+                            downloaded.map { it.toMediaItem() }
+                        } else {
+                            val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                            local.forEach { songCache[it.videoId] = it }
+                            local.map { it.toMediaItem() }
+                        }
                     }
                     resultItems.map { it.withGridStyle() }
                 }
                 MEDIA_QUICK_PICKS_ID -> {
                     isGridFolder = true
-                    val home = cachedHomeFeed()
-                    val allItems = home?.shelves?.flatMap { shelf ->
-                        shelf.items.mapNotNull { it.toMediaItemOrNull() }
-                    } ?: emptyList()
-                    allItems.distinctBy { it.mediaId }.map { it.withGridStyle() }
+                    val allItems = try {
+                        withTimeoutOrNull(2500L) {
+                            val home = cachedHomeFeed()
+                            home?.shelves?.flatMap { shelf ->
+                                shelf.items.mapNotNull { it.toMediaItemOrNull() }
+                            }
+                        } ?: emptyList()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+
+                    val resultItems = if (allItems.isNotEmpty()) {
+                        allItems.distinctBy { it.mediaId }
+                    } else {
+                        val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        if (downloaded.isNotEmpty()) {
+                            downloaded.forEach { songCache[it.videoId] = it }
+                            downloaded.map { it.toMediaItem() }
+                        } else {
+                            val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                            local.forEach { songCache[it.videoId] = it }
+                            local.map { it.toMediaItem() }
+                        }
+                    }
+                    resultItems.map { it.withGridStyle() }
                 }
                 MEDIA_LIKED_ID -> {
-                    val library = YtMusicRepository.library().getOrNull()
-                    val songs = library?.likedSongs?.ifEmpty { null }
-                        ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
-                        ?: emptyList()
+                    val songs = try {
+                        withTimeoutOrNull(2500L) {
+                            val library = YtMusicRepository.library().getOrNull()
+                            library?.likedSongs?.ifEmpty { null }
+                                ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
+                        } ?: emptyList()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
                     songs.forEach { songCache[it.videoId] = it }
-                    songs.map { it.toMediaItem() }
+                    val resultItems = if (songs.isNotEmpty()) {
+                        songs.map { it.toMediaItem() }
+                    } else {
+                        val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        downloaded.forEach { songCache[it.videoId] = it }
+                        downloaded.map { it.toMediaItem() }
+                    }
+                    resultItems
                 }
                 MEDIA_DOWNLOADS_ID -> {
                     val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
@@ -3629,7 +3676,13 @@ class PlaybackService : MediaLibraryService() {
                     downloaded.map { it.toMediaItem() }
                 }
                 MEDIA_PLAYLISTS_ID -> {
-                    val playlists = YtMusicRepository.userPlaylists().getOrNull() ?: emptyList()
+                    val playlists = try {
+                        withTimeoutOrNull(2500L) {
+                            YtMusicRepository.userPlaylists().getOrNull()
+                        } ?: emptyList()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
                     playlists.map { playlist ->
                         MediaItem.Builder()
                             .setMediaId("playlist:${playlist.playlistId}")
@@ -3655,15 +3708,26 @@ class PlaybackService : MediaLibraryService() {
                     when {
                         parentId.startsWith("playlist:") -> {
                             val playlistId = parentId.removePrefix("playlist:")
-                            val songs = YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
-                                ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
-                                ?: emptyList()
+                            val songs = try {
+                                withTimeoutOrNull(2500L) {
+                                    YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
+                                        ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
+                                } ?: emptyList()
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
                             songs.forEach { songCache[it.videoId] = it }
                             songs.map { it.toMediaItem() }
                         }
                         parentId.startsWith("browse:") -> {
                             val browseId = parentId.removePrefix("browse:")
-                            val songs = YtMusicRepository.browseSongs(browseId).getOrNull()?.songs ?: emptyList()
+                            val songs = try {
+                                withTimeoutOrNull(2500L) {
+                                    YtMusicRepository.browseSongs(browseId).getOrNull()?.songs
+                                } ?: emptyList()
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
                             songs.forEach { songCache[it.videoId] = it }
                             songs.map { it.toMediaItem() }
                         }
@@ -3782,10 +3846,16 @@ class PlaybackService : MediaLibraryService() {
             }
 
             // 5. Fallback to Quick Picks / Home shelves
-            val home = YtMusicRepository.home().getOrNull()
-            val fallbackSongs = home?.shelves?.flatMap { shelf ->
-                shelf.items.mapNotNull { it.toMediaItemOrNull() }
-            }?.distinctBy { it.mediaId } ?: emptyList()
+            val fallbackSongs = try {
+                withTimeoutOrNull(2500L) {
+                    val home = YtMusicRepository.home().getOrNull()
+                    home?.shelves?.flatMap { shelf ->
+                        shelf.items.mapNotNull { it.toMediaItemOrNull() }
+                    }?.distinctBy { it.mediaId }
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
 
             if (fallbackSongs.isNotEmpty()) {
                 return@future MediaSession.MediaItemsWithStartPosition(
@@ -3795,7 +3865,12 @@ class PlaybackService : MediaLibraryService() {
                 )
             }
 
-            throw UnsupportedOperationException("No resume data available")
+            // Return empty instead of throwing an unhandled exception to prevent crash
+            MediaSession.MediaItemsWithStartPosition(
+                ImmutableList.of(),
+                0,
+                0L,
+            )
         }
 
         override fun onSearch(
@@ -3804,7 +3879,13 @@ class PlaybackService : MediaLibraryService() {
             query: String,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<Void>> = scope.future(Dispatchers.IO) {
-            val results = YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull() ?: emptyList()
+            val results = try {
+                withTimeoutOrNull(3000L) {
+                    YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull()
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
             val songs = results.mapNotNull { if (it is SearchResult.Track) it.song else null }
             searchResults[query] = songs
             songs.forEach { songCache[it.videoId] = it }
@@ -3820,11 +3901,14 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
-            val songs = searchResults[query] ?: (
-                YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull()
-                    ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
-                    ?: emptyList()
-            )
+            val songs = searchResults[query] ?: try {
+                withTimeoutOrNull(3000L) {
+                    YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull()
+                        ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
             songs.forEach { songCache[it.videoId] = it }
             val fromIndex = (page * pageSize).coerceAtMost(songs.size)
             val toIndex = ((page + 1) * pageSize).coerceAtMost(songs.size)
@@ -3840,7 +3924,7 @@ class PlaybackService : MediaLibraryService() {
             startIndex: Int,
             startPositionMs: Long,
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future(Dispatchers.IO) {
-            val resolved = onAddMediaItems(mediaSession, controller, mediaItems).get()
+            val resolved = resolveMediaItems(mediaItems)
             val validIndex = startIndex.coerceIn(0, (resolved.size - 1).coerceAtLeast(0))
             MediaSession.MediaItemsWithStartPosition(
                 ImmutableList.copyOf(resolved),
@@ -3854,6 +3938,10 @@ class PlaybackService : MediaLibraryService() {
             controller: MediaSession.ControllerInfo,
             mediaItems: List<MediaItem>,
         ): ListenableFuture<List<MediaItem>> = scope.future(Dispatchers.IO) {
+            resolveMediaItems(mediaItems)
+        }
+
+        private suspend fun resolveMediaItems(mediaItems: List<MediaItem>): List<MediaItem> {
             val resolved = mutableListOf<MediaItem>()
             for (item in mediaItems) {
                 val id = item.mediaId
@@ -3864,9 +3952,14 @@ class PlaybackService : MediaLibraryService() {
                         val songs = if (!cached.isNullOrEmpty()) {
                             cached
                         } else {
-                            YtMusicRepository.search(searchQuery, SearchFilter.SONGS).getOrNull()
-                                ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
-                                ?: emptyList()
+                            try {
+                                withTimeoutOrNull(3000L) {
+                                    YtMusicRepository.search(searchQuery, SearchFilter.SONGS).getOrNull()
+                                        ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
+                                } ?: emptyList()
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
                         }
                         songs.forEach { songCache[it.videoId] = it }
                         if (songs.isNotEmpty()) {
@@ -3875,15 +3968,26 @@ class PlaybackService : MediaLibraryService() {
                     }
                     id.startsWith("playlist:") -> {
                         val playlistId = id.removePrefix("playlist:")
-                        val songs = YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
-                            ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
-                            ?: emptyList()
+                        val songs = try {
+                            withTimeoutOrNull(3000L) {
+                                YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
+                                    ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                         songs.forEach { songCache[it.videoId] = it }
                         resolved.addAll(songs.map { it.toMediaItem() })
                     }
                     id.startsWith("browse:") -> {
                         val browseId = id.removePrefix("browse:")
-                        val songs = YtMusicRepository.browseSongs(browseId).getOrNull()?.songs ?: emptyList()
+                        val songs = try {
+                            withTimeoutOrNull(3000L) {
+                                YtMusicRepository.browseSongs(browseId).getOrNull()?.songs
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                         songs.forEach { songCache[it.videoId] = it }
                         resolved.addAll(songs.map { it.toMediaItem() })
                     }
@@ -3891,12 +3995,18 @@ class PlaybackService : MediaLibraryService() {
                         val last = LastPlayed.load()
                         val lastSongs = last?.songs ?: emptyList()
                         lastSongs.forEach { songCache[it.videoId] = it }
-                        val home = YtMusicRepository.home().getOrNull()
-                        val recentShelf = home?.shelves?.firstOrNull {
-                            it.title.contains("recent", ignoreCase = true) ||
-                                it.title.contains("listen again", ignoreCase = true)
-                        } ?: home?.shelves?.firstOrNull()
-                        val ytRecentSongs = recentShelf?.items?.mapNotNull { it.toMediaItemOrNull() } ?: emptyList()
+                        val ytRecentSongs = try {
+                            withTimeoutOrNull(2000L) {
+                                val home = cachedHomeFeed()
+                                val recentShelf = home?.shelves?.firstOrNull {
+                                    it.title.contains("recent", ignoreCase = true) ||
+                                        it.title.contains("listen again", ignoreCase = true)
+                                } ?: home?.shelves?.firstOrNull()
+                                recentShelf?.items?.mapNotNull { it.toMediaItemOrNull() }
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                         val combined = (lastSongs.map { it.toMediaItem() } + ytRecentSongs).distinctBy { it.mediaId }
                         if (combined.isNotEmpty()) {
                             resolved.addAll(combined)
@@ -3909,17 +4019,28 @@ class PlaybackService : MediaLibraryService() {
                         }
                     }
                     id == MEDIA_QUICK_PICKS_ID -> {
-                        val home = YtMusicRepository.home().getOrNull()
-                        val allItems = home?.shelves?.flatMap { shelf ->
-                            shelf.items.mapNotNull { it.toMediaItemOrNull() }
-                        } ?: emptyList()
+                        val allItems = try {
+                            withTimeoutOrNull(2500L) {
+                                val home = cachedHomeFeed()
+                                home?.shelves?.flatMap { shelf ->
+                                    shelf.items.mapNotNull { it.toMediaItemOrNull() }
+                                }
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                         resolved.addAll(allItems.distinctBy { it.mediaId })
                     }
                     id == MEDIA_LIKED_ID -> {
-                        val lib = YtMusicRepository.library().getOrNull()
-                        val songs = lib?.likedSongs?.ifEmpty { null }
-                            ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
-                            ?: emptyList()
+                        val songs = try {
+                            withTimeoutOrNull(2500L) {
+                                val lib = YtMusicRepository.library().getOrNull()
+                                lib?.likedSongs?.ifEmpty { null }
+                                    ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
                         songs.forEach { songCache[it.videoId] = it }
                         resolved.addAll(songs.map { it.toMediaItem() })
                     }
@@ -3929,15 +4050,20 @@ class PlaybackService : MediaLibraryService() {
                         resolved.addAll(downloaded.map { it.toMediaItem() })
                     }
                     id == MEDIA_PLAYLISTS_ID -> {
-                        val playlists = YtMusicRepository.userPlaylists().getOrNull() ?: emptyList()
-                        val first = playlists.firstOrNull()
-                        if (first != null) {
-                            val songs = YtMusicRepository.browseSongs("VL${first.playlistId}").getOrNull()?.songs
-                                ?: YtMusicRepository.browseSongs(first.playlistId).getOrNull()?.songs
-                                ?: emptyList()
-                            songs.forEach { songCache[it.videoId] = it }
-                            resolved.addAll(songs.map { it.toMediaItem() })
+                        val songs = try {
+                            withTimeoutOrNull(2500L) {
+                                val playlists = YtMusicRepository.userPlaylists().getOrNull() ?: emptyList()
+                                val first = playlists.firstOrNull()
+                                if (first != null) {
+                                    YtMusicRepository.browseSongs("VL${first.playlistId}").getOrNull()?.songs
+                                        ?: YtMusicRepository.browseSongs(first.playlistId).getOrNull()?.songs
+                                } else null
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
                         }
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
                     }
                     id == MEDIA_LOCAL_MUSIC_ID -> {
                         val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
@@ -3975,7 +4101,7 @@ class PlaybackService : MediaLibraryService() {
                     }
                 }
             }
-            if (resolved.isEmpty()) mediaItems else resolved
+            return if (resolved.isEmpty()) mediaItems else resolved
         }
     }
 
