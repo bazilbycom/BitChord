@@ -83,10 +83,8 @@ class AndroidAutoMediaLibraryTest {
         val mediaIds = items.map { it.mediaId }
         assertTrue("Must contain 'recents'", mediaIds.contains("recents"))
         assertTrue("Must contain 'quick_picks'", mediaIds.contains("quick_picks"))
-        assertTrue("Must contain 'liked'", mediaIds.contains("liked"))
-        assertTrue("Must contain 'downloads'", mediaIds.contains("downloads"))
         assertTrue("Must contain 'playlists'", mediaIds.contains("playlists"))
-        assertTrue("Must contain 'local_music'", mediaIds.contains("local_music"))
+        assertTrue("Must contain 'more'", mediaIds.contains("more"))
     }
 
     @Test
